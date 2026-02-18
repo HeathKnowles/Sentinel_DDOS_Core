@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sentinel DDoS Core - Real-time Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            padding: 20px;
+            background: #161b22;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .header h1 {
+            color: #58a6ff;
+            margin-bottom: 10px;
+        }
+
+        .status {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        .status.connected {
+            background: #238636;
+            color: white;
+        }
+
+        .status.disconnected {
+            background: #da3633;
+            color: white;
+        }
+
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+        }
+
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 200px;
+        }
+
+        .card h2 {
+            color: #58a6ff;
+            font-size: 18px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 10px;
+        }
+
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #21262d;
+        }
+
+        .metric:last-child {
+            border-bottom: none;
+        }
+
+        .metric-label {
+            color: #8b949e;
+        }
+
+        .metric-value {
+            color: #58a6ff;
+            font-weight: bold;
+        }
+
+        .activity-log {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .activity-entry {
+            background: #0d1117;
+            padding: 10px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        .activity-time {
+            color: #6e7681;
+            font-size: 11px;
+        }
+
+        .activity-action {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+
+        .action-BLOCK { background: #da3633; color: white; }
+        .action-RATE_LIMIT { background: #f85149; color: white; }
+        .action-QUARANTINE { background: #d29922; color: #000; }
+
+        .ip-list {
+            max-height: 250px;
+            overflow-y: auto;
+        }
+
+        .ip-entry {
+            background: #0d1117;
+            padding: 8px;
+            margin-bottom: 5px;
+            border-radius: 4px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+        }
+
+        .top-source {
+            background: #0d1117;
+            padding: 10px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        .top-source.suspicious {
+            border-left: 3px solid #da3633;
+        }
+
+        .progress-bar {
+            height: 20px;
+            background: #21262d;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 5px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #238636, #2ea043);
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🛡️ Sentinel DDoS Core - Real-time Dashboard</h1>
+        <p>WebSocket Status: <span class="status disconnected" id="ws-status">Disconnected</span></p>
+    </div>
+
+    <div class="dashboard">
+        <!-- Metrics -->
+        <div class="card">
+            <h2>📊 System Metrics</h2>
+            <div id="metrics">
+                <div class="metric"><span class="metric-label">Packets/sec:</span><span class="metric-value" id="m-pps">0</span></div>
+                <div class="metric"><span class="metric-label">Bytes/sec:</span><span class="metric-value" id="m-bps">0</span></div>
+                <div class="metric"><span class="metric-label">Active Flows:</span><span class="metric-value" id="m-flows">0</span></div>
+                <div class="metric"><span class="metric-label">ML Classifications/sec:</span><span class="metric-value" id="m-ml">0</span></div>
+                <div class="metric"><span class="metric-label">CPU Usage:</span><span class="metric-value" id="m-cpu">0%</span></div>
+                <div class="metric"><span class="metric-label">Memory:</span><span class="metric-value" id="m-mem">0 MB</span></div>
+            </div>
+        </div>
+
+        <!-- Traffic Rate -->
+        <div class="card">
+            <h2>📈 Traffic Rate</h2>
+            <div id="traffic">
+                <div class="metric"><span class="metric-label">Total PPS:</span><span class="metric-value" id="tr-pps">0</span></div>
+                <div class="metric"><span class="metric-label">Total BPS:</span><span class="metric-value" id="tr-bps">0</span></div>
+                <div class="metric"><span class="metric-label">TCP PPS:</span><span class="metric-value" id="tr-tcp">0</span></div>
+                <div class="metric"><span class="metric-label">UDP PPS:</span><span class="metric-value" id="tr-udp">0</span></div>
+                <div class="metric"><span class="metric-label">ICMP PPS:</span><span class="metric-value" id="tr-icmp">0</span></div>
+            </div>
+        </div>
+
+        <!-- Protocol Distribution -->
+        <div class="card">
+            <h2>🔀 Protocol Distribution</h2>
+            <div id="protocol">
+                <div class="metric">
+                    <span class="metric-label">TCP:</span>
+                    <span class="metric-value" id="pd-tcp">0%</span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill" id="pd-tcp-bar" style="width: 0%"></div></div>
+                <div class="metric">
+                    <span class="metric-label">UDP:</span>
+                    <span class="metric-value" id="pd-udp">0%</span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill" id="pd-udp-bar" style="width: 0%"></div></div>
+                <div class="metric">
+                    <span class="metric-label">ICMP:</span>
+                    <span class="metric-value" id="pd-icmp">0%</span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill" id="pd-icmp-bar" style="width: 0%"></div></div>
+            </div>
+        </div>
+
+        <!-- Mitigation Status -->
+        <div class="card">
+            <h2>🚨 Mitigation Status</h2>
+            <div id="mitigation">
+                <div class="metric"><span class="metric-label">Blocked:</span><span class="metric-value" id="ms-blocked">0</span></div>
+                <div class="metric"><span class="metric-label">Rate Limited:</span><span class="metric-value" id="ms-ratelimit">0</span></div>
+                <div class="metric"><span class="metric-label">Monitored:</span><span class="metric-value" id="ms-monitored">0</span></div>
+                <div class="metric"><span class="metric-label">Whitelisted:</span><span class="metric-value" id="ms-whitelist">0</span></div>
+            </div>
+        </div>
+
+        <!-- Activity Log -->
+        <div class="card" style="grid-column: span 2;">
+            <h2>📝 Activity Log (Real-time)</h2>
+            <div class="activity-log" id="activity-log">
+                <p style="color: #6e7681; text-align: center; padding: 20px;">Waiting for events...</p>
+            </div>
+        </div>
+
+        <!-- Top Sources -->
+        <div class="card">
+            <h2>🔝 Top Traffic Sources</h2>
+            <div id="top-sources">
+                <p style="color: #6e7681; text-align: center; padding: 20px;">No data yet</p>
+            </div>
+        </div>
+
+        <!-- Blocked IPs -->
+        <div class="card">
+            <h2>🚫 Blocked IPs</h2>
+            <div class="ip-list" id="blocked-ips">
+                <p style="color: #6e7681; text-align: center; padding: 20px;">No blocked IPs</p>
+            </div>
+        </div>
+
+        <!-- Rate Limited IPs -->
+        <div class="card">
+            <h2>⏱️ Rate Limited IPs</h2>
+            <div class="ip-list" id="ratelimited-ips">
+                <p style="color: #6e7681; text-align: center; padding: 20px;">No rate limited IPs</p>
+            </div>
+        </div>
+
+        <!-- Feature Importance -->
+        <div class="card">
+            <h2>🧠 ML Feature Importance</h2>
+            <div id="feature-importance">
+                <div class="metric">
+                    <span class="metric-label">Volume Weight:</span>
+                    <span class="metric-value" id="fi-volume">0</span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill" id="fi-volume-bar" style="width: 0%"></div></div>
+                <div class="metric">
+                    <span class="metric-label">Entropy Weight:</span>
+                    <span class="metric-value" id="fi-entropy">0</span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill" id="fi-entropy-bar" style="width: 0%"></div></div>
+                <div class="metric">
+                    <span class="metric-label">Protocol Weight:</span>
+                    <span class="metric-value" id="fi-protocol">0</span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill" id="fi-protocol-bar" style="width: 0%"></div></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let reconnectInterval = 5000;
+        let activityBuffer = [];
+        const MAX_ACTIVITY_ENTRIES = 50;
+
+        function formatIP(ip) {
+            return `${ip & 0xFF}.${(ip >> 8) & 0xFF}.${(ip >> 16) & 0xFF}.${(ip >> 24) & 0xFF}`;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(2) + ' KB';
+            if (bytes < 1073741824) return (bytes / 1048576).toFixed(2) + ' MB';
+            return (bytes / 1073741824).toFixed(2) + ' GB';
+        }
+
+        function formatNumber(num) {
+            if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+            if (num >= 1000) return (num / 1000).toFixed(2) + 'K';
+            return num.toString();
+        }
+
+        function formatTimestamp(ns) {
+            const date = new Date(ns / 1000000);
+            return date.toLocaleTimeString();
+        }
+
+        function connectWebSocket() {
+            const wsUrl = 'ws://localhost:8765';
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                document.getElementById('ws-status').textContent = 'Connected';
+                document.getElementById('ws-status').className = 'status connected';
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected, reconnecting...');
+                document.getElementById('ws-status').textContent = 'Disconnected';
+                document.getElementById('ws-status').className = 'status disconnected';
+                setTimeout(connectWebSocket, reconnectInterval);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    handleMessage(message);
+                } catch (error) {
+                    console.error('Error parsing message:', error);
+                }
+            };
+        }
+
+        function handleMessage(msg) {
+            const data = msg.data;
+
+            switch (msg.type) {
+                case 'metrics':
+                    document.getElementById('m-pps').textContent = formatNumber(data.packets_per_sec);
+                    document.getElementById('m-bps').textContent = formatBytes(data.bytes_per_sec) + '/s';
+                    document.getElementById('m-flows').textContent = formatNumber(data.active_flows);
+                    document.getElementById('m-ml').textContent = formatNumber(data.ml_classifications_per_sec);
+                    document.getElementById('m-cpu').textContent = data.cpu_usage_percent.toFixed(1) + '%';
+                    document.getElementById('m-mem').textContent = data.memory_usage_mb.toFixed(0) + ' MB';
+                    break;
+
+                case 'traffic_rate':
+                    document.getElementById('tr-pps').textContent = formatNumber(data.total_pps);
+                    document.getElementById('tr-bps').textContent = formatBytes(data.total_bps) + '/s';
+                    document.getElementById('tr-tcp').textContent = formatNumber(data.tcp_pps);
+                    document.getElementById('tr-udp').textContent = formatNumber(data.udp_pps);
+                    document.getElementById('tr-icmp').textContent = formatNumber(data.icmp_pps);
+                    break;
+
+                case 'protocol_distribution':
+                    document.getElementById('pd-tcp').textContent = data.tcp_percent.toFixed(1) + '%';
+                    document.getElementById('pd-tcp-bar').style.width = data.tcp_percent + '%';
+                    document.getElementById('pd-udp').textContent = data.udp_percent.toFixed(1) + '%';
+                    document.getElementById('pd-udp-bar').style.width = data.udp_percent + '%';
+                    document.getElementById('pd-icmp').textContent = data.icmp_percent.toFixed(1) + '%';
+                    document.getElementById('pd-icmp-bar').style.width = data.icmp_percent + '%';
+                    break;
+
+                case 'mitigation_status':
+                    document.getElementById('ms-blocked').textContent = formatNumber(data.total_blocked);
+                    document.getElementById('ms-ratelimit').textContent = formatNumber(data.total_rate_limited);
+                    document.getElementById('ms-monitored').textContent = formatNumber(data.total_monitored);
+                    document.getElementById('ms-whitelist').textContent = formatNumber(data.total_whitelisted);
+                    break;
+
+                case 'activity_logs':
+                    const log = data;
+                    activityBuffer.unshift(log);
+                    if (activityBuffer.length > MAX_ACTIVITY_ENTRIES) {
+                        activityBuffer.pop();
+                    }
+                    updateActivityLog();
+                    break;
+
+                case 'top_sources':
+                    updateTopSources(data.sources);
+                    break;
+
+                case 'blocked_ips':
+                    updateIPList('blocked-ips', data.ips);
+                    break;
+
+                case 'rate_limited_ips':
+                    updateIPList('ratelimited-ips', data.ips);
+                    break;
+
+                case 'feature_importance':
+                    document.getElementById('fi-volume').textContent = data.volume_weight.toFixed(2);
+                    document.getElementById('fi-volume-bar').style.width = (data.volume_weight * 100) + '%';
+                    document.getElementById('fi-entropy').textContent = data.entropy_weight.toFixed(2);
+                    document.getElementById('fi-entropy-bar').style.width = (data.entropy_weight * 100) + '%';
+                    document.getElementById('fi-protocol').textContent = data.protocol_weight.toFixed(2);
+                    document.getElementById('fi-protocol-bar').style.width = (data.protocol_weight * 100) + '%';
+                    break;
+            }
+        }
+
+        function updateActivityLog() {
+            const container = document.getElementById('activity-log');
+            if (activityBuffer.length === 0) {
+                container.innerHTML = '<p style="color: #6e7681; text-align: center; padding: 20px;">Waiting for events...</p>';
+                return;
+            }
+
+            container.innerHTML = activityBuffer.map(log => `
+                <div class="activity-entry">
+                    <div>
+                        <span class="activity-time">${formatTimestamp(log.timestamp_ns)}</span>
+                        <span class="activity-action action-${log.action}">${log.action}</span>
+                        <strong>${formatIP(log.src_ip)}</strong>
+                    </div>
+                    <div style="margin-top: 5px; color: #8b949e;">
+                        ${log.attack_type} - ${log.reason} (score: ${log.threat_score.toFixed(2)})
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateTopSources(sources) {
+            const container = document.getElementById('top-sources');
+            if (!sources || sources.length === 0) {
+                container.innerHTML = '<p style="color: #6e7681; text-align: center; padding: 20px;">No data yet</p>';
+                return;
+            }
+
+            container.innerHTML = sources.map(src => `
+                <div class="top-source ${src.suspicious ? 'suspicious' : ''}">
+                    <div><strong>${formatIP(src.src_ip)}</strong> ${src.suspicious ? '⚠️' : ''}</div>
+                    <div style="margin-top: 5px; color: #8b949e; font-size: 12px;">
+                        Packets: ${formatNumber(src.packets)} | Bytes: ${formatBytes(src.bytes)} | Flows: ${src.flow_count}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateIPList(containerId, ips) {
+            const container = document.getElementById(containerId);
+            if (!ips || ips.length === 0) {
+                container.innerHTML = `<p style="color: #6e7681; text-align: center; padding: 20px;">No ${containerId.replace('-', ' ')}</p>`;
+                return;
+            }
+
+            container.innerHTML = ips.map(entry => `
+                <div class="ip-entry">
+                    <span><strong>${formatIP(entry.ip)}</strong></span>
+                    <span style="color: #6e7681; font-size: 12px;">${new Date(entry.timestamp_added * 1000).toLocaleTimeString()}</span>
+                </div>
+            `).join('');
+        }
+
+        // Connect on page load
+        connectWebSocket();
+    </script>
+</body>
+</html>
