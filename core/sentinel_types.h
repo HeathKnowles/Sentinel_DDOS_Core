@@ -41,13 +41,15 @@ extern "C" {
  * FLOW KEY  (5-tuple that identifies a uni-directional flow)
  * ============================================================================ */
 
+/* 16-byte aligned for 128-bit lane / AVX2 hash; no packed (SIGBUS on ARM/MIPS/SPARC). */
 typedef struct sentinel_flow_key {
     uint32_t src_ip;        /* network byte order */
     uint32_t dst_ip;        /* network byte order */
     uint16_t src_port;      /* network byte order */
     uint16_t dst_port;      /* network byte order */
     uint8_t  protocol;      /* IPPROTO_TCP / UDP / ICMP */
-} __attribute__((packed)) sentinel_flow_key_t;
+    uint8_t  _pad[3];       /* pad to 16 bytes for cache-line / vector alignment */
+} sentinel_flow_key_t;
 
 /* ============================================================================
  * FEATURE VECTOR  (output of featureextractor, input of decision engine)
@@ -110,6 +112,12 @@ typedef struct sentinel_feature_vector {
     uint32_t src_total_flows;       /* how many distinct flows from this src */
     uint64_t src_total_packets;     /* total packets from this src (all flows) */
     double   src_packets_per_second;
+
+    /* --- L7 True Payload features --- */
+    uint32_t http_request_count;    /* count of parsed HTTP GET/POST reqs */
+    uint32_t dns_query_count;       /* count of parsed DNS query payloads */
+    uint64_t dns_tx_id_sum;         /* sum of DNS Transaction IDs (entropy for random-query floods) */
+    uint64_t dns_qcount_sum;        /* sum of DNS QDCOUNT (question count) */
 
     /* --- raw scores (filled by extractor as hints) --- */
     double   anomaly_hint;          /* 0.0 = normal, 1.0 = anomalous */

@@ -70,6 +70,7 @@ typedef struct fe_packet {
     uint64_t timestamp_ns;     /* kernel nanosecond timestamp */
     uint8_t  ttl;
     uint8_t  tcp_flags;        /* raw TCP flags byte (SYN=0x02 etc.) */
+    uint32_t hw_hash;          /* Reserved; core uses software FNV-1a only (hash parity). */
     const uint8_t *payload;    /* first N bytes, may be NULL */
 } fe_packet_t;
 
@@ -104,6 +105,11 @@ int fe_extract_source(fe_context_t *ctx,
  *  Convenience wrapper.  Returns 0 on success. */
 int fe_extract_last(fe_context_t *ctx, sentinel_feature_vector_t *out);
 
+/*  Interval-based extraction (zero-lookup): return 1 if this flow should be extracted now.
+ *  now_ns: coarse time from pipeline (avoid clock_gettime per packet). Call fe_mark_extracted after extract. */
+int fe_should_extract(fe_context_t *ctx, uint64_t now_ns);
+void fe_mark_extracted(fe_context_t *ctx, uint64_t now_ns);
+
 /* ============================================================================
  * MAINTENANCE
  * ============================================================================ */
@@ -116,6 +122,19 @@ uint32_t fe_active_flows(const fe_context_t *ctx);
 
 /*  Return the number of tracked source IPs. */
 uint32_t fe_active_sources(const fe_context_t *ctx);
+
+/*  Fill top traffic sources by packet count (for telemetry).
+ *  out must hold at least max_count entries. Returns number filled (0..max_count). */
+typedef struct fe_top_source {
+    uint32_t src_ip;
+    uint64_t packets;
+    uint64_t bytes;
+    uint32_t flow_count;
+} fe_top_source_t;
+uint32_t fe_get_top_sources(fe_context_t *ctx, fe_top_source_t *out, uint32_t max_count);
+
+/*  Write back the last threat score for a flow (for threat-aware eviction). */
+void fe_writeback_threat(fe_context_t *ctx, const sentinel_flow_key_t *key, double score);
 
 #ifdef __cplusplus
 }

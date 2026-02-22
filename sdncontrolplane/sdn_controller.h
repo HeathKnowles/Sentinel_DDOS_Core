@@ -35,6 +35,7 @@ typedef struct sdn_config {
     uint32_t connect_timeout_ms;    /* libcurl connect timeout                */
     uint32_t request_timeout_ms;    /* libcurl request timeout                */
     int      verify_ssl;            /* 0 = skip SSL verify (dev only)         */
+    char     auth_bearer_token[64]; /* optional: bearer token for CURLOPT_HTTPAUTH */
 } sdn_config_t;
 
 #define SDN_CONFIG_DEFAULT { \
@@ -43,7 +44,8 @@ typedef struct sdn_config {
     .default_table     = "0",                      \
     .connect_timeout_ms = 5000,                    \
     .request_timeout_ms = 10000,                   \
-    .verify_ssl         = 0                        \
+    .verify_ssl         = 0,                       \
+    .auth_bearer_token  = ""                       \
 }
 
 /* ============================================================================
@@ -64,7 +66,8 @@ void            sdn_destroy(sdn_context_t *ctx);
  * ============================================================================ */
 
 /*  Push a flow rule to the Ryu controller.
- *  Returns 0 on success, -1 on error.  */
+ *  Returns 0 on success, SDN_ERR_QUEUE_FULL if busy. */
+#define SDN_ERR_QUEUE_FULL -2
 int sdn_push_rule(sdn_context_t *ctx, const sentinel_sdn_rule_t *rule);
 
 /*  Remove a rule by its ID (cookie), dpid, and table.
@@ -99,6 +102,10 @@ int sdn_health_check(sdn_context_t *ctx);
 /*  Get the number of flows installed on a dpid (table 0).
  *  Returns the flow count, or -1 on error. */
 int sdn_get_flow_count(sdn_context_t *ctx, const char *node_id);
+
+/*  Check if the SDN command queue is saturated (>90% full).
+ *  Returns 1 if saturated, 0 otherwise. */
+int sdn_is_saturated(const sdn_context_t *ctx);
 
 /*  Get the total rules pushed since init. */
 uint64_t sdn_rules_pushed(const sdn_context_t *ctx);

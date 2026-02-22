@@ -206,8 +206,9 @@ void ws_update_mitigation_status(ws_context_t *ctx, const ws_mitigation_status_t
  * STATISTICS
  * ============================================================================ */
 
-uint32_t ws_get_client_count(const ws_context_t *ctx);
+uint32_t ws_get_client_count(ws_context_t *ctx);
 uint64_t ws_get_messages_sent(const ws_context_t *ctx);
+uint64_t ws_get_messages_dropped(const ws_context_t *ctx);
 
 #ifdef __cplusplus
 }

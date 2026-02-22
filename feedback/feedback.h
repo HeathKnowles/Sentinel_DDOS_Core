@@ -64,7 +64,7 @@ typedef struct fb_record {
     sentinel_verdict_e   verdict;
     sentinel_attack_type_t attack_type;
     double               threat_score;
-    fb_outcome_t         outcome;
+    _Atomic fb_outcome_t outcome;
     uint64_t             timestamp_ns;
 } fb_record_t;
 

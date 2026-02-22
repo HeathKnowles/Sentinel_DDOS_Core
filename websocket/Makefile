@@ -1,14 +1,17 @@
 # Sentinel DDoS Core - WebSocket Server Makefile
 
 CC       ?= gcc
-CFLAGS   := -Wall -Wextra -O2 -std=c11 -I../core -pthread
+CFLAGS   := -Wall -Wextra -O2 -std=c11 -I../core -pthread -MMD -MP
 LDFLAGS  := -lssl -lcrypto
 AR       := ar
 ARFLAGS  := rcs
 
 SOURCES  := websocket_server.c
 OBJECTS  := $(SOURCES:.c=.o)
+DEPS     := $(SOURCES:.c=.d)
 TARGET   := libwebsocket.a
+
+-include $(DEPS)
 
 .PHONY: all clean
 
@@ -21,4 +24,4 @@ $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(OBJECTS) $(DEPS) $(TARGET)

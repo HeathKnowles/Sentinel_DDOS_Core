@@ -1,14 +1,16 @@
-# Sentinel DDoS Core - Decision Engine
-# Builds libdecisionengine.a
+# Sentinel DDoS Core - Decision Engine (with -MMD for .h dependency tracking)
 
 CC       ?= gcc
 AR       ?= ar
-CFLAGS   := -Wall -Wextra -O2 -std=c11 -I../core
+CFLAGS   := -Wall -Wextra -O2 -std=c11 -I../core -MMD -MP
 LDLIBS   := -lm
 
 SRCS     := decision_engine.c
 OBJS     := $(SRCS:.c=.o)
+DEPS     := $(SRCS:.c=.d)
 LIB      := libdecisionengine.a
+
+-include $(DEPS)
 
 .PHONY: all clean
 
@@ -21,4 +23,4 @@ $(LIB): $(OBJS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(LIB)
+	rm -f $(OBJS) $(DEPS) $(LIB)

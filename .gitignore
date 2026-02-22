@@ -3,3 +3,11 @@ build/
 *.symvers
 *.order
 .vscode/
+.venv-controller/
+*.o
+*.a
+*.so
+*.d
+sentinel_pipeline
+tests/integration_test
+*.log

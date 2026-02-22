@@ -3,12 +3,15 @@
 
 CC       ?= gcc
 AR       ?= ar
-CFLAGS   := -Wall -Wextra -O2 -std=c11 -I../core
+CFLAGS   := -Wall -Wextra -O2 -std=c11 -I../core -MMD -MP
 LDLIBS   := -lm
 
 SRCS     := feedback.c
 OBJS     := $(SRCS:.c=.o)
+DEPS     := $(SRCS:.c=.d)
 LIB      := libfeedback.a
+
+-include $(DEPS)
 
 .PHONY: all clean
 
@@ -21,4 +24,4 @@ $(LIB): $(OBJS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(LIB)
+	rm -f $(OBJS) $(DEPS) $(LIB)

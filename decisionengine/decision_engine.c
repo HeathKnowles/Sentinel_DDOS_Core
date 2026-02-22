@@ -28,21 +28,28 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
-#include "decision_engine.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
 #include <arpa/inet.h>
 
+#include "decision_engine.h"
+#include "ml_model.h"
+#include "../feedback/feedback.h"
+#include <stdatomic.h>
+
 /* ============================================================================
  * INTERNAL CONSTANTS
  * ============================================================================ */
 
-#define BASELINE_BUCKETS 8192
+#define BASELINE_BUCKETS 131072  /* Keep hash chains short under high-cardinality sources. */
 #define LIST_BUCKETS     1024
+#define MAX_BASELINES    1000000 /* hard cap: no unbounded calloc under spoofed-SYN OOM */
+#define MAX_BASELINE_CHAIN 8     /* cap bucket chain walk: no unbounded loop at eviction */
 
 /* ============================================================================
  * PER-SOURCE EWMA BASELINE
@@ -56,7 +63,8 @@ typedef struct baseline_entry {
     /* EWMA of bytes_per_second */
     double   ewma_bps;
     double   ewma_bps_var;
-    uint32_t observations;
+    uint32_t observations_pps;
+    uint32_t observations_bps;
     struct baseline_entry *next;
 } baseline_entry_t;
 
@@ -77,6 +85,8 @@ struct de_context {
     de_thresholds_t cfg;
 
     baseline_entry_t **baselines;
+    baseline_entry_t  *baseline_slab;   /* pre-allocated slab: zero hot-path alloc */
+    baseline_entry_t  *baseline_free;   /* free list into slab */
     uint32_t           baseline_count;
 
     ip_entry_t **allowlist;
@@ -110,6 +120,10 @@ de_context_t *de_init(const de_thresholds_t *cfg)
         de_thresholds_t def = DE_THRESHOLDS_DEFAULT;
         ctx->cfg = def;
     }
+    /* Division-by-zero guard: thresh and sigma must be > 0. */
+    if (ctx->cfg.udp_pps_thresh <= 0) ctx->cfg.udp_pps_thresh = 50000;
+    if (ctx->cfg.icmp_pps_thresh <= 0) ctx->cfg.icmp_pps_thresh = 5000;
+    if (ctx->cfg.ewma_volume_sigma <= 0.0) ctx->cfg.ewma_volume_sigma = 3.0;
 
     ctx->baselines = calloc(BASELINE_BUCKETS, sizeof(baseline_entry_t *));
     ctx->allowlist = calloc(LIST_BUCKETS, sizeof(ip_entry_t *));
@@ -123,17 +137,63 @@ de_context_t *de_init(const de_thresholds_t *cfg)
         return NULL;
     }
 
+    /* Pre-allocate baseline slab: avoid dynamic allocation in hot path. */
+    ctx->baseline_slab = calloc(MAX_BASELINES, sizeof(baseline_entry_t));
+    if (!ctx->baseline_slab) {
+        free(ctx->baselines);
+        free(ctx->allowlist);
+        free(ctx->denylist);
+        free(ctx);
+        return NULL;
+    }
+    ctx->baseline_free = &ctx->baseline_slab[0];
+    for (uint32_t i = 0; i + 1 < MAX_BASELINES; i++)
+        ctx->baseline_slab[i].next = &ctx->baseline_slab[i + 1];
+    ctx->baseline_slab[MAX_BASELINES - 1].next = NULL;
+
     return ctx;
+}
+
+const de_thresholds_t *de_get_thresholds(const de_context_t *ctx)
+{
+    return ctx ? &ctx->cfg : NULL;
+}
+
+void de_apply_adjustments(de_context_t *ctx, const void *adj)
+{
+    if (!ctx || !adj) return;
+    const fb_adjustments_t *a = (const fb_adjustments_t *)adj;
+    if (!a->should_adjust) return;
+
+    double allow = atomic_load_explicit(&ctx->cfg.score_allow_max, memory_order_relaxed);
+    double rate  = atomic_load_explicit(&ctx->cfg.score_rate_limit, memory_order_relaxed);
+    double drop  = atomic_load_explicit(&ctx->cfg.score_drop, memory_order_relaxed);
+
+    allow += a->delta_allow_max;
+    if (allow < 0.0) allow = 0.0;
+    if (allow > 1.0) allow = 1.0;
+
+    rate += a->delta_rate_limit;
+    if (rate < allow) rate = allow;
+    if (rate > 1.0)   rate = 1.0;
+
+    drop += a->delta_drop;
+    if (drop < rate) drop = rate;
+    if (drop > 1.0)  drop = 1.0;
+
+    atomic_store_explicit(&ctx->cfg.score_allow_max, allow, memory_order_release);
+    atomic_store_explicit(&ctx->cfg.score_rate_limit, rate,  memory_order_release);
+    atomic_store_explicit(&ctx->cfg.score_drop,       drop,  memory_order_release);
 }
 
 void de_destroy(de_context_t *ctx)
 {
     if (!ctx) return;
 
-    for (uint32_t i = 0; i < BASELINE_BUCKETS; i++) {
-        baseline_entry_t *b = ctx->baselines[i];
-        while (b) { baseline_entry_t *n = b->next; free(b); b = n; }
-    }
+    /* Baselines are in slab; no per-node free. */
+    free(ctx->baseline_slab);
+    ctx->baseline_slab = NULL;
+    ctx->baseline_free = NULL;
     free(ctx->baselines);
 
     for (uint32_t i = 0; i < LIST_BUCKETS; i++) {
@@ -204,8 +264,41 @@ static baseline_entry_t *get_baseline(de_context_t *ctx, uint32_t src_ip)
         if (bl->src_ip == src_ip) return bl;
         bl = bl->next;
     }
-    bl = calloc(1, sizeof(*bl));
+    /* At cap: reuse a node from this bucket with bounded chain walk. */
+    if (ctx->baseline_count >= MAX_BASELINES) {
+        baseline_entry_t **prev = &ctx->baselines[b];
+        baseline_entry_t *cur = *prev;
+        uint32_t steps = 0;
+        while (cur && cur->next && steps < MAX_BASELINE_CHAIN) {
+            prev = &cur->next;
+            cur = cur->next;
+            steps++;
+        }
+        if (cur) {
+            *prev = cur->next;
+            memset(cur, 0, sizeof(*cur));
+            cur->src_ip = src_ip;
+            cur->next = ctx->baselines[b];
+            ctx->baselines[b] = cur;
+            return cur;  /* reused; count unchanged */
+        }
+        /* Chain longer than MAX_BASELINE_CHAIN: reuse head of bucket. */
+        cur = ctx->baselines[b];
+        if (cur) {
+            ctx->baselines[b] = cur->next;
+            memset(cur, 0, sizeof(*cur));
+            cur->src_ip = src_ip;
+            cur->next = ctx->baselines[b];
+            ctx->baselines[b] = cur;
+            return cur;
+        }
+        return NULL;
+    }
+    /* Take from pre-allocated slab (no allocation in hot path). */
+    bl = ctx->baseline_free;
     if (!bl) return NULL;
+    ctx->baseline_free = bl->next;
+    memset(bl, 0, sizeof(*bl));
     bl->src_ip = src_ip;
     bl->next = ctx->baselines[b];
     ctx->baselines[b] = bl;
@@ -219,29 +312,40 @@ static baseline_entry_t *get_baseline(de_context_t *ctx, uint32_t src_ip)
 
 static double ewma_update_and_score(double value,
                                     double *ewma, double *ewma_var,
-                                    uint32_t *obs, double alpha)
+                                    uint32_t *obs, double smoothing)
 {
+    /* Sanitize float inputs to prevent NaN/Inf propagation. */
+    if (isnan(value) || isinf(value))
+        value = 0.0;
+
     if (*obs == 0) {
-        /* first observation: initialise */
         *ewma = value;
         *ewma_var = 0.0;
         (*obs)++;
         return 0.0;
     }
 
-    /* update EWMA */
-    double prev = *ewma;
-    *ewma = alpha * value + (1.0 - alpha) * prev;
+    /* Drift protection: periodic variance decay. */
+    if (*obs > 1000000000u) {
+        *obs = 1000000u;
+        *ewma_var *= 0.5;
+        if (*ewma_var < 1e-18) *ewma_var = 0.0;
+    }
 
-    /* update variance (Welford-EWMA hybrid) */
+    double prev = *ewma;
+    *ewma = smoothing * value + (1.0 - smoothing) * prev;
     double diff = value - prev;
-    *ewma_var = (1.0 - alpha) * (*ewma_var) + alpha * diff * diff;
+    *ewma_var = (1.0 - smoothing) * (*ewma_var) + smoothing * diff * diff;
     (*obs)++;
 
-    /* compute z-score */
+    /* Clamp outputs so NaN/Inf cannot propagate. */
+    if (isnan(*ewma) || isinf(*ewma)) *ewma = 0.0;
+    if (isnan(*ewma_var) || isinf(*ewma_var) || *ewma_var < 0.0) *ewma_var = 0.0;
+
     double sigma = sqrt(*ewma_var);
     if (sigma < 1e-9) return 0.0;
-    return fabs(value - *ewma) / sigma;
+    double z = fabs(value - *ewma) / sigma;
+    return (isnan(z) || isinf(z)) ? 0.0 : z;
 }
 
 /* ============================================================================
@@ -250,9 +354,18 @@ static double ewma_update_and_score(double value,
 
 static inline double clamp01(double x)
 {
+    if (isnan(x) || isinf(x)) return 0.0;
     if (x < 0.0) return 0.0;
     if (x > 1.0) return 1.0;
     return x;
+}
+
+/* Non-linear z-to-score: logistic mapping centered at 3 sigma to reduce false positives on noisy traffic. */
+static inline double z_to_score(double z_ratio)
+{
+    if (z_ratio <= 0.0) return 0.0;
+    if (z_ratio >= 6.0) return 1.0;
+    return 1.0 / (1.0 + exp(-2.0 * (z_ratio - 3.0)));
 }
 
 /* ============================================================================
@@ -265,15 +378,15 @@ static double score_volume(de_context_t *ctx,
 {
     double z_pps = ewma_update_and_score(f->packets_per_second,
                                           &bl->ewma_pps, &bl->ewma_pps_var,
-                                          &bl->observations, ctx->cfg.ewma_alpha);
+                                          &bl->observations_pps, ctx->cfg.ewma_smoothing);
     double z_bps = ewma_update_and_score(f->bytes_per_second,
                                           &bl->ewma_bps, &bl->ewma_bps_var,
-                                          &bl->observations, ctx->cfg.ewma_alpha);
+                                          &bl->observations_bps, ctx->cfg.ewma_smoothing);
 
-    /* normalise z-score to [0,1] using the configured sigma threshold */
+    /* Non-linear mapping: z/sigma -> [0,1] via logistic (deviation not linear) */
     double sigma = ctx->cfg.ewma_volume_sigma;
-    double s_pps = clamp01(z_pps / sigma);
-    double s_bps = clamp01(z_bps / sigma);
+    double s_pps = z_to_score(z_pps / sigma);
+    double s_bps = z_to_score(z_bps / sigma);
 
     /* take the max as the volume score */
     return (s_pps > s_bps) ? s_pps : s_bps;
@@ -334,13 +447,13 @@ static double score_protocol(de_context_t *ctx,
         }
     }
 
-    /* UDP flood */
-    if (f->protocol == 17 && f->packets_per_second > ctx->cfg.udp_pps_thresh) {
+    /* UDP flood (guard division: thresh enforced > 0 in de_init). */
+    if (f->protocol == 17 && ctx->cfg.udp_pps_thresh > 0 && f->packets_per_second > ctx->cfg.udp_pps_thresh) {
         score += clamp01(f->packets_per_second / (ctx->cfg.udp_pps_thresh * 5.0));
     }
 
-    /* ICMP flood */
-    if (f->protocol == 1 && f->packets_per_second > ctx->cfg.icmp_pps_thresh) {
+    /* ICMP flood (guard division: thresh enforced > 0 in de_init). */
+    if (f->protocol == 1 && ctx->cfg.icmp_pps_thresh > 0 && f->packets_per_second > ctx->cfg.icmp_pps_thresh) {
         score += clamp01(f->packets_per_second / (ctx->cfg.icmp_pps_thresh * 3.0));
     }
 
@@ -405,14 +518,139 @@ static double score_behavioral(de_context_t *ctx,
 }
 
 /* ============================================================================
+ * MODEL 5: MACHINE LEARNING (DECISION TREE / RANDOM FOREST ENSEMBLE)
+ * ============================================================================ */
+
+/* Heuristic min-max ranges for model input normalization (avoid raw large integers). */
+static void ml_minmax_scale(double *x)
+{
+    static const double lo[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const double hi[] = {
+        1e6, 1e9, 1, 1, 8, 8, 65535, 1500, 1000, 100, 1, 8, 65535, 64, 16, 1e6, 1e6, 10000, 1e6, 1000
+    };
+    for (int i = 0; i < 20; i++) {
+        double range = hi[i] - lo[i];
+        if (range > 0) {
+            if (x[i] < lo[i]) x[i] = 0.0;
+            else if (x[i] > hi[i]) x[i] = 1.0;
+            else x[i] = (x[i] - lo[i]) / range;
+        }
+    }
+}
+
+static double score_ml_inference(const sentinel_feature_vector_t *f)
+{
+    /*
+     * Min-max normalize inputs then ML inference (statistically robust).
+     * Output probability calibrated with logistic sigmoid.
+     */
+    double input[20];
+    input[0]  = f->packets_per_second;
+    input[1]  = f->bytes_per_second;
+    input[2]  = f->syn_ratio;
+    input[3]  = f->rst_ratio;
+    input[4]  = f->dst_port_entropy;
+    input[5]  = f->payload_byte_entropy;
+    input[6]  = (double)f->unique_dst_ports;
+    input[7]  = f->avg_packet_size;
+    input[8]  = f->stddev_packet_size;
+    input[9]  = (double)f->http_request_count;
+    input[10] = f->fin_ratio;
+    input[11] = f->src_port_entropy;
+    input[12] = (double)f->unique_src_ports;
+    input[13] = f->avg_ttl;
+    input[14] = f->stddev_ttl;
+    input[15] = f->avg_iat_us;
+    input[16] = f->stddev_iat_us;
+    input[17] = (double)f->src_total_flows;
+    input[18] = f->src_packets_per_second;
+    input[19] = (double)f->dns_query_count;
+    ml_minmax_scale(input);
+    double output[2];
+    ml_scratch_t scr;
+    score(input, output, &scr);
+    double p = output[1];
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    {
+        const double k = 6.0;  /* steepness: sharpens decision around 0.5 */
+        double x = k * (p - 0.5);
+        if (x >= 20.0) return 1.0;
+        if (x <= -20.0) return 0.0;
+        return 1.0 / (1.0 + exp(-x));
+    }
+}
+
+/* ============================================================================
+ * MODEL 6: LAYER 7 / ASYMMETRY ANOMALY
+ * ============================================================================ */
+
+static double score_l7_asymmetry(de_context_t *ctx,
+                                 const sentinel_feature_vector_t *f)
+{
+    double score = 0.0;
+
+    /* Only evaluate if we have enough packets to make a judgment */
+    if (f->packet_count < ctx->cfg.l7_asymmetry_count_thresh) {
+        return 0.0;
+    }
+
+    /* TCP Application Attack Profile (e.g., HTTP GET floods) */
+    if (f->protocol == 6) {
+        /*
+         * True L7 Parsing detection: 
+         * If we actively parsed HTTP method strings (GET/POST) in the payload buffer, 
+         * and the user is blasting them fast, this is definitively an L7 flood.
+         */
+        if (f->http_request_count > 20 && f->packets_per_second > 50) {
+            score += 0.8; /* High confidence L7 Flood */
+        }
+
+        /*
+         * Asymmetry fallback: Attacker sends very small requests (HTTP GET)
+         * and expects large responses. Usually translates to low avg_packet_size
+         * on the ingress path with high frequency.
+         */
+        else if (f->avg_packet_size < ctx->cfg.l7_asymmetry_size_thresh && f->packets_per_second > 100) {
+            score += 0.4;
+        }
+
+        /* 
+         * Push flag dominance: 
+         * High application data frequency usually sets PSH flags often.
+         */
+        double psh_ratio = (double)f->psh_count / f->packet_count;
+        if (psh_ratio > 0.8) {
+            score += 0.2;
+        }
+
+        /* 
+         * Application Structural Uniformity:
+         * All requests look exactly the same (botnet tools often fail to randomize L7 headers)
+         */
+        if (f->payload_byte_entropy > 0 && f->payload_byte_entropy < 0.20) {
+            score += 0.3;
+        }
+    }
+
+    return clamp01(score);
+}
+
+/* ============================================================================
  * ATTACK TYPE CLASSIFICATION
  * ============================================================================ */
 
 static sentinel_attack_type_t classify_attack(const sentinel_feature_vector_t *f,
                                               double s_vol, double s_ent,
-                                              double s_proto, double s_behav)
+                                              double s_proto, double s_behav,
+                                              double s_ml, double s_l7)
 {
     (void)s_ent;  /* entropy score not used directly for type classification */
+    (void)s_ml;   /* ML flags anomalies broadly */
+
+    /* Layer 7 Application Flood */
+    if (s_l7 > 0.6 && f->protocol == 6)
+        return SENTINEL_ATTACK_UNKNOWN; /* Typically indicates an L7 GET/POST flood */
 
     /* LAND attack */
     if (f->src_ip == f->dst_ip && f->src_ip != 0)
@@ -497,31 +735,43 @@ int de_classify(de_context_t *ctx,
     baseline_entry_t *bl = get_baseline(ctx, features->src_ip);
     if (!bl) return -1;
 
-    /* run all four models */
+    /* run all six models */
     double s_vol   = score_volume(ctx, features, bl);
     double s_ent   = score_entropy(ctx, features);
     double s_proto = score_protocol(ctx, features);
     double s_behav = score_behavioral(ctx, features);
+    double s_ml    = score_ml_inference(features);
+    double s_l7    = score_l7_asymmetry(ctx, features);
 
     /* weighted combination */
     double threat = ctx->cfg.weight_volume    * s_vol
                   + ctx->cfg.weight_entropy   * s_ent
                   + ctx->cfg.weight_protocol  * s_proto
-                  + ctx->cfg.weight_behavioral * s_behav;
+                  + ctx->cfg.weight_behavioral * s_behav
+                  + ctx->cfg.weight_ml        * s_ml
+                  + ctx->cfg.weight_l7        * s_l7;
+
+    /* Absolute Reckoning Fix: Global Weight Normalization */
+    double total_weight = ctx->cfg.weight_volume + ctx->cfg.weight_entropy +
+                         ctx->cfg.weight_protocol + ctx->cfg.weight_behavioral +
+                         ctx->cfg.weight_ml + ctx->cfg.weight_l7;
+    if (total_weight > 0.0) threat /= total_weight;
+
     threat = clamp01(threat);
 
     /* confidence: higher when more observations and scores agree */
     double agreement = 1.0;
     {
-        double scores[4] = { s_vol, s_ent, s_proto, s_behav };
-        double mean = (s_vol + s_ent + s_proto + s_behav) / 4.0;
+        double scores[6] = { s_vol, s_ent, s_proto, s_behav, s_ml, s_l7 };
+        double mean = (s_vol + s_ent + s_proto + s_behav + s_ml + s_l7) / 6.0;
         double var = 0;
-        for (int i = 0; i < 4; i++) var += (scores[i] - mean) * (scores[i] - mean);
-        var /= 4.0;
+        for (int i = 0; i < 6; i++) var += (scores[i] - mean) * (scores[i] - mean);
+        var /= 6.0;
         /* low variance -> high agreement -> high confidence */
         agreement = 1.0 - clamp01(sqrt(var));
     }
-    double obs_factor = clamp01((double)bl->observations / 50.0);
+    double obs_mean = ((double)bl->observations_pps + (double)bl->observations_bps) * 0.5;
+    double obs_factor = clamp01(obs_mean / 50.0);
     double confidence = 0.5 * agreement + 0.5 * obs_factor;
 
     /* store scores */
@@ -529,23 +779,30 @@ int de_classify(de_context_t *ctx,
     out->score_entropy    = s_ent;
     out->score_protocol   = s_proto;
     out->score_behavioral = s_behav;
+    /* ML and L7 aren't included in the public threat assessment breakdown 
+       struct yet, so we don't assign them here but they affect total threat_score */
     out->threat_score     = threat;
     out->confidence       = confidence;
 
+    /* Load thresholds once (atomic: no torn read vs feedback thread). */
+    double allow = atomic_load_explicit(&ctx->cfg.score_allow_max, memory_order_relaxed);
+    double rate  = atomic_load_explicit(&ctx->cfg.score_rate_limit, memory_order_relaxed);
+    double drop  = atomic_load_explicit(&ctx->cfg.score_drop, memory_order_relaxed);
+
     /* classify attack type */
-    if (threat > ctx->cfg.score_allow_max) {
-        out->attack_type = classify_attack(features, s_vol, s_ent, s_proto, s_behav);
+    if (threat > allow) {
+        out->attack_type = classify_attack(features, s_vol, s_ent, s_proto, s_behav, s_ml, s_l7);
     } else {
         out->attack_type = SENTINEL_ATTACK_NONE;
     }
 
     /* map score to verdict */
-    if (threat <= ctx->cfg.score_allow_max) {
+    if (threat <= allow) {
         out->verdict = VERDICT_ALLOW;
-    } else if (threat <= ctx->cfg.score_rate_limit) {
+    } else if (threat <= rate) {
         out->verdict = VERDICT_RATE_LIMIT;
         out->rate_limit_pps = ctx->cfg.default_rate_limit;
-    } else if (threat <= ctx->cfg.score_drop) {
+    } else if (threat <= drop) {
         out->verdict = VERDICT_DROP;
     } else {
         out->verdict = VERDICT_QUARANTINE;
@@ -566,16 +823,13 @@ int de_classify(de_context_t *ctx,
 
 void de_reset_baselines(de_context_t *ctx)
 {
-    if (!ctx) return;
-    for (uint32_t i = 0; i < BASELINE_BUCKETS; i++) {
-        baseline_entry_t *b = ctx->baselines[i];
-        while (b) {
-            baseline_entry_t *n = b->next;
-            free(b);
-            b = n;
-        }
+    if (!ctx || !ctx->baseline_slab) return;
+    for (uint32_t i = 0; i < BASELINE_BUCKETS; i++)
         ctx->baselines[i] = NULL;
-    }
+    ctx->baseline_free = &ctx->baseline_slab[0];
+    for (uint32_t i = 0; i + 1 < MAX_BASELINES; i++)
+        ctx->baseline_slab[i].next = &ctx->baseline_slab[i + 1];
+    ctx->baseline_slab[MAX_BASELINES - 1].next = NULL;
     ctx->baseline_count = 0;
 }
 

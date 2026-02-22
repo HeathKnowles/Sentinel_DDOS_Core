@@ -1,6 +1,6 @@
 # Sentinel DDoS Core - Kernel-Level Proxy System Architecture
 
-**Complete System Overview & Implementation Guide**
+**Legacy (Netfilter):** This document describes the **Netfilter-based** design (sentinel_proxy.ko, /dev/sentinel_proxy). The **Tier-1 production dataplane** uses **AF_XDP** and the eBPF program `sentinel_xdp.c` in this directory. See root `RYU_INTEGRATION.md` for the AF_XDP setup. The content below is retained for reference only.
 
 ---
 

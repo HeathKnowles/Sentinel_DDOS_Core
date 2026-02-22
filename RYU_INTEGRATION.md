@@ -1,242 +1,113 @@
-# Sentinel DDoS Core - Ryu Integration
+# Sentinel DDoS Core Controller Integration
 
-## Quick Start
+This document covers running Sentinel with a real OpenFlow controller endpoint that exposes `/stats/*` APIs.
 
-### 1. Start Ryu Controller
+## Supported Controller Runtime
+
+Use `start_ryu.py` from this repository. It starts whichever runtime is available in this order:
+
+1. local `.venv-controller/bin/ryu-manager`
+2. system `ryu-manager`
+3. system `osken-manager`
+4. `python3 -m ryu.cmd.manager`
+5. `python3 -m os_ken.cmd.manager`
+
+Required app set:
+- switch behavior: `simple_switch_13` (Ryu) or `ofp_handler` (OS-Ken equivalent)
+- REST endpoints: `ofctl_rest`
+
+## End-To-End Setup
+
+Run these commands from `Sentinel_DDOS_Core/`.
+
+### 1. Start controller
+
 ```bash
-ryu-manager ryu.app.simple_switch_13 ryu.app.ofctl_rest
+python3 start_ryu.py
 ```
 
-This starts Ryu with:
-- `simple_switch_13`: Basic L2 learning switch (OpenFlow 1.3)
-- `ofctl_rest`: REST API on port 8080
+Expected behavior:
+- OpenFlow listener on `0.0.0.0:6633`
+- REST listener on `0.0.0.0:8080`
 
-### 2. Start Mininet Topology
+Quick check:
+
 ```bash
-sudo mn --topo single,3 \
-  --controller=remote,ip=127.0.0.1,port=6633 \
-  --switch ovs,protocols=OpenFlow13
+curl -s http://127.0.0.1:8080/stats/switches
 ```
 
-This creates:
-- 1 OVS switch (dpid=1)
-- 3 hosts (h1, h2, h3)
-- OpenFlow 1.3 protocol
+### 2. Start Mininet test topology
 
-### 3. Test Ryu Integration
+```bash
+sudo mn --topo single,3 --controller=remote,ip=127.0.0.1,port=6633 --switch ovs,protocols=OpenFlow13
+```
+
+### 3. Verify controller REST flow operations
+
 ```bash
 ./test_ryu_integration.sh
 ```
 
-This verifies:
-- ✓ Ryu is reachable
-- ✓ Flows can be pushed
-- ✓ Flows can be deleted
-- ✓ Cookie-based tracking works
+What it validates:
+- controller reachability
+- flow add
+- flow count increase
+- strict flow delete
 
-### 4. Start Sentinel Pipeline
+### 4. Start Sentinel pipeline against controller
+
 ```bash
-sudo ./start_with_ryu.sh
+sudo ./sentinel_pipeline -i eth0 -q 0 --controller http://127.0.0.1:8080 --dpid 1 -v
 ```
 
-This will:
-- Load `sentinel_proxy.ko` kernel module
-- Start the pipeline with `--dpid 1`
-- Connect to Ryu at `http://127.0.0.1:8080`
+## Useful Runtime Checks
 
----
-
-## Testing DDoS Detection
-
-### From Mininet CLI
+List switches:
 
 ```bash
-# Normal traffic (should work)
-mininet> h1 ping -c 3 h2
-
-# UDP flood (will be detected and blocked)
-mininet> h1 hping3 -2 -i u1 -p 53 10.0.0.2
-
-# SYN flood (will be detected and blocked)
-mininet> h3 hping3 -S -i u1 -p 80 10.0.0.2
+curl -s http://127.0.0.1:8080/stats/switches
 ```
 
-### Check Sentinel Flows in Ryu
+List flows on switch 1:
 
 ```bash
-# List all flows on switch 1
-curl http://127.0.0.1:8080/stats/flow/1 | python3 -m json.tool
-
-# Filter for Sentinel flows (cookie prefix 0x5E40000000000000)
-curl -s http://127.0.0.1:8080/stats/flow/1 | \
-  python3 -c "import sys,json; flows=json.load(sys.stdin)['1']; \
-  [print(f) for f in flows if f['cookie'] > 6791418742620364800]"
+curl -s http://127.0.0.1:8080/stats/flow/1 | python3 -m json.tool
 ```
 
-### Monitor Sentinel Pipeline
+Send pipeline stats signal:
 
 ```bash
-# Send SIGUSR1 for stats
 sudo killall -USR1 sentinel_pipeline
+```
 
-# Send SIGUSR2 to reset baselines
+Reset runtime baselines:
+
+```bash
 sudo killall -USR2 sentinel_pipeline
 ```
 
----
-
-## Configuration
-
-### Sentinel Pipeline Options
-
-```
-./sentinel_pipeline [OPTIONS]
-  -d, --daemon           Daemonise
-  -m, --mode MODE        Filter mode: learn/detect/protect (default protect)
-  -c, --controller URL   Ryu REST URL (default http://127.0.0.1:8080)
-  -n, --dpid DPID        Default switch dpid (default 1)
-  -v, --verbose          Verbose logging
-  -h, --help             This message
-```
-
-### Filter Modes
-
-- **learn**: Passively observe traffic, build baselines (no blocking)
-- **detect**: Detect attacks, log alerts (no blocking)
-- **protect**: Detect attacks and push blocking rules to Ryu
-
----
-
-## Architecture
-
-```
-┌─────────────┐
-│   Mininet   │  h1, h2, h3
-│   Topology  │  (10.0.0.1, 10.0.0.2, 10.0.0.3)
-└──────┬──────┘
-       │ OpenFlow
-       ↓
-┌─────────────┐
-│  OVS Switch │  dpid=1
-│   (s1)      │  OpenFlow 1.3
-└──────┬──────┘
-       │ OpenFlow 1.3
-       ↓
-┌─────────────────────┐
-│   Ryu Controller    │  Port 6633 (OpenFlow)
-│  - simple_switch_13 │  Port 8080 (REST API)
-│  - ofctl_rest       │
-└──────┬──────────────┘
-       │ REST API (port 8080)
-       ↓
-┌──────────────────────────────────┐
-│    Sentinel DDoS Core            │
-│                                  │
-│  ┌────────────────────────────┐  │
-│  │  sentinel_proxy.ko         │  │  Intercepts packets
-│  │  (kernel module)           │  │  via netfilter hooks
-│  └────────┬───────────────────┘  │
-│           │ /dev/sentinel_proxy  │
-│           ↓                      │
-│  ┌────────────────────────────┐  │
-│  │  sentinel_pipeline         │  │  Feature extraction
-│  │  (userspace daemon)        │  │  ML heuristics
-│  │                            │  │  Decision engine
-│  │  - Feature Extractor       │  │
-│  │  - Decision Engine         │  │
-│  │  - SDN Controller (Ryu)    │  │  Push flows via REST
-│  │  - Feedback Loop           │  │
-│  └────────────────────────────┘  │
-└──────────────────────────────────┘
-```
-
----
-
-## Flow Format (Ryu ofctl_rest)
-
-Sentinel flows use a **cookie prefix** `0x5E40000000000000` for identification:
-
-```json
-{
-  "dpid": 1,
-  "cookie": 6791418742620373999,
-  "cookie_mask": 18374686479671623680,
-  "table_id": 0,
-  "idle_timeout": 120,
-  "hard_timeout": 300,
-  "priority": 500,
-  "match": {
-    "dl_type": 2048,
-    "nw_src": "10.0.0.1/32",
-    "nw_proto": 17,
-    "tp_src": 12345
-  },
-  "actions": []
-}
-```
-
-- Empty `actions` = DROP
-- `{"type": "OUTPUT", "port": "NORMAL"}` = ALLOW
-- `{"type": "OUTPUT", "port": N}` = REDIRECT to port N
-
----
-
 ## Troubleshooting
 
-### Ryu not reachable
-```bash
-# Check if Ryu is running
-curl http://127.0.0.1:8080/stats/switches
+Controller endpoint not reachable:
 
-# Restart Ryu
-ryu-manager ryu.app.simple_switch_13 ryu.app.ofctl_rest
+```bash
+curl -v http://127.0.0.1:8080/stats/switches
 ```
 
-### Kernel module issues
-```bash
-# Check if loaded
-lsmod | grep sentinel_proxy
+If `/stats/*` returns 404, controller is running without `ofctl_rest`.
 
-# Check dmesg for errors
-dmesg | tail -20
+No switch appears in `/stats/switches`:
+- confirm Mininet started with `--switch ovs,protocols=OpenFlow13`
+- confirm controller is listening on port `6633`
+- confirm no local firewall blocks loopback or bridge traffic
 
-# Reload module
-sudo rmmod sentinel_proxy
-sudo insmod proxy/sentinel_proxy.ko
-```
-
-### Device not found
-```bash
-# Check device exists
-ls -l /dev/sentinel_proxy
-
-# Check kernel log
-dmesg | grep sentinel
-```
-
-### No flows pushed
-```bash
-# Check Sentinel logs (verbose mode)
-sudo ./sentinel_pipeline --verbose --dpid 1
-
-# Verify Ryu is receiving requests
-# (watch Ryu terminal for POST /stats/flowentry/add)
-```
-
----
+Flow add fails:
+- verify `dpid` value in Sentinel args matches topology switch DPID
+- inspect controller stderr for rejected match/action payload
 
 ## Cleanup
 
 ```bash
-# Stop Sentinel pipeline
-sudo killall sentinel_pipeline
-
-# Unload kernel module
-sudo rmmod sentinel_proxy
-
-# Stop Mininet
+sudo killall sentinel_pipeline 2>/dev/null || true
 sudo mn -c
-
-# Stop Ryu
-# (Ctrl+C in Ryu terminal)
 ```

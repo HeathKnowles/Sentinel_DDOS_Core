@@ -245,16 +245,32 @@ enum sentinel_filter_mode {
 #else
 /* Userspace helper macros (only define if not already provided by system) */
 #ifndef htons
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define htons(x) __builtin_bswap16(x)
+#else
+#define htons(x) (x)
+#endif
 #endif
 #ifndef htonl
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define htonl(x) __builtin_bswap32(x)
+#else
+#define htonl(x) (x)
+#endif
 #endif
 #ifndef ntohs
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define ntohs(x) __builtin_bswap16(x)
+#else
+#define ntohs(x) (x)
+#endif
 #endif
 #ifndef ntohl
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define ntohl(x) __builtin_bswap32(x)
+#else
+#define ntohl(x) (x)
+#endif
 #endif
 #endif
 

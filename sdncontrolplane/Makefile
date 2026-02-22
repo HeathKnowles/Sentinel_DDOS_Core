@@ -23,6 +23,10 @@ check-deps:
 	   echo "  Fedora: dnf install libcurl-devel" && \
 	   exit 1)
 
+CFLAGS   += -MMD -MP
+DEPS     := $(SRCS:.c=.d)
+-include $(DEPS)
+
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
 
@@ -30,4 +34,4 @@ $(LIB): $(OBJS)
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libcurl 2>/dev/null) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(LIB)
+	rm -f $(OBJS) $(DEPS) $(LIB)
