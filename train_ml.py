@@ -344,27 +344,6 @@ def gather_datasets(data_dirs=None, min_total=100000):
     y = np.concatenate(y_all)
     if len(X) < min_total:
         raise RuntimeError(f"Insufficient real samples: {len(X)} < required {min_total}.")
-    return X, y
-
-
-
-
-def train_and_export_model():
-    print("Gathering training data (CICDDoS2019, UNSW-NB15, CAIDA-style)...")
-    X, y = gather_datasets(min_total=100000)
-    print(f"Total samples: {len(X)} (min 100000 required)")
-
-
-    # Replace inf/nan for robustness
-    X = np.nan_to_num(X, nan=0.0, posinf=1e9, neginf=0.0)
-    X = np.clip(X, 0, 1e10)
-
-    print("Training RandomForestClassifier (n_estimators=100, max_depth=15)...")
-    clf = RandomForestClassifier(n_estimators=100, max_depth=15, random_state=42, n_jobs=-1)
-    clf.fit(X, y)
-
-    print("Exporting model to C code using m2cgen...")
-    code = m2c.export_to_c(clf)
 
     c_header = """/*
  * AUTO-GENERATED MACHINE LEARNING MODEL
